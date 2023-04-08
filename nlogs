@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+import json
+import datetime
+from datetime import timedelta
+import os
+from dataclasses import dataclass
+import subprocess
+import re
+import sys
+from api_v1_client.api.admin import (
+    admin_get_project_by_id,
+    admin_get_branches,
+    admin_get_branch_by_id,
+    admin_get_endpoints,
+    admin_get_endpoint_by_id,
+)
+from api_v1_client import Client
+
+
+def make_api_client(console_url: str, oauth_token) -> Client:
+    """
+    Creates a client.
+    """
+    default_headers = {
+        "accept": "application/json",
+    }
+    api_url = f"{console_url}/api/v1"
+
+    default_headers["Authorization"] = f"Bearer {oauth_token}"
+    return Client(
+        api_url,
+        headers=default_headers,
+        timeout=20,
+        verify_ssl=True,
+    )
+
+
+# pretty print raw response.content result of sync_detailed
+def pp(raw_content):
+    parsed = json.loads(raw_content)
+    print(json.dumps(parsed, indent=4))
+
+
+def project_id_to_tenant_id(client, project_id):
+    project = admin_get_project_by_id.sync_detailed(
+        project_id=project_id,
+        client=client,
+    )
+    return project.parsed.project.tenant
+
+
+def branch_id_to_timeline_id(client, branch_id):
+    branch = admin_get_branch_by_id.sync_detailed(branch_id=branch_id, client=client)
+    return branch.parsed.branch.timeline_id
+
+
+@dataclass()
+class Endpoint:
+    """Single endpoint"""
+
+    project_id: str
+    tenant_id: str
+    region_id: str
+    branch_id: str
+    timeline_id: str
+    endpoint_id: str
+
+
+# Return Endpoint for the project_id, if there is only one endpoint.
+def project_id_to_endpoint(client, project_id):
+    endpoints = admin_get_endpoints.sync_detailed(
+        search=project_id,
+        client=client,
+    ).parsed.data
+    if len(endpoints) != 1:
+        raise ValueError(f"endpoints len {len(endpoints)}")
+    ep = endpoints[0]
+    endpoint_id = ep.id
+    return endpoint_id_to_endpoint(client, endpoint_id)
+
+
+def endpoint_id_to_endpoint(client, endpoint_id):
+    ep = admin_get_endpoint_by_id.sync_detailed(endpoint_id=endpoint_id, client=client)
+    branch_id = ep.parsed.endpoint.branch_id
+    timeline_id = branch_id_to_timeline_id(client, branch_id)
+    project_id = ep.parsed.endpoint.project_id
+    tenant_id = project_id_to_tenant_id(client, project_id)
+    region_id = ep.parsed.endpoint.region_id.removeprefix(
+        "aws-"
+    )  # loki neon_region label doesn't have aws-
+    return Endpoint(
+        project_id, tenant_id, region_id, branch_id, timeline_id, endpoint_id
+    )
+
+
+# fill env variables required to access loki
+def setup_logcli():
+    if "LOKI_ADDR" in os.environ:
+        return  # exit if already set up to save time
+    creds = subprocess.check_output(
+        [
+            "aws",
+            "--profile",
+            "prod",
+            "--region",
+            "us-east-2",
+            "secretsmanager",
+            "get-secret-value",
+            "--secret-id",
+            "prod/logcli-developer-credentials",
+        ]
+    )
+    secret_string = json.loads(json.loads(creds)["SecretString"])
+    os.environ["LOKI_ADDR"] = secret_string["url"]
+    os.environ["LOKI_USERNAME"] = secret_string["username"]
+    os.environ["LOKI_PASSWORD"] = secret_string["access-token"]
+
+
+@dataclass()
+class LogCli:
+    """logcli runner"""
+
+    from_ts: datetime.datetime
+    to_ts: datetime.datetime
+    limit: int
+
+    # run logcli and return stdout, optionally printing it
+    def run(self, query: str, print_output=True) -> str:
+        # --forward makes ordering natural
+        cmd = [
+            "logcli",
+            "query",
+            "--include-label=hostname",
+            "--timezone=UTC",
+            f"--from={self.from_ts.isoformat()}Z",
+            f"--to={self.to_ts.isoformat()}Z",
+            f"--limit={self.limit}",
+            "--forward",
+            "--quiet",
+            query,
+        ]
+        print(f"running {' '.join(cmd)}")
+        output = subprocess.check_output(cmd).decode("utf-8")
+        # truncate away loki timestamp, we have internal one
+        lines_without_ts = []
+        for line in output.splitlines():
+            if line.find("{") >= 0:
+                lines_without_ts.append(line[line.find("{") :])
+            else:
+                lines_without_ts.append(line)
+        output_without_ts = "\n".join(lines_without_ts)
+        if print_output:
+            print(output_without_ts)
+        return output_without_ts
+
+
+@dataclass()
+class LogSelection:
+    """For which services to dump logs"""
+
+    ps: bool
+    sk: bool
+    compute: bool
+    pgbouncer: bool
+    proxy: bool
+
+
+# print logs of endpoint ep
+def endpoint_logs(cli: LogCli, ep: Endpoint, log_selection: LogSelection):
+    if log_selection.ps:
+        ps_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="pageserver"}} |= "{ep.timeline_id}"'
+        cli.run(ps_query)
+    if log_selection.sk:
+        sk_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="safekeeper"}} |= "{ep.timeline_id}"'
+        cli.run(sk_query)
+    if log_selection.compute:
+        compute_query = f'{{neon_env="prod", neon_region="{ep.region_id}", app="compute-node-{ep.endpoint_id}", container="compute-node"}} != "OpenTelemetry" != "serving /status"'
+        cli.run(compute_query)
+    if log_selection.pgbouncer:
+        pgbouncer_query = f'{{neon_env="prod", neon_region="{ep.region_id}", app="compute-node-{ep.endpoint_id}", container="pgbouncer"}}'
+        cli.run(pgbouncer_query)
+    if log_selection.proxy:
+        proxy_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="proxy-scram"}} |= "{ep.endpoint_id}"'
+        # for proxy, find all session ids (uuid) and include in search
+        proxy_endpoint_entries = cli.run(proxy_query, print_output=False)
+        session_id_re = re.compile("session_id=(.{36})")
+        session_ids = set()
+        for endpoint_entry in proxy_endpoint_entries.splitlines():
+            match = session_id_re.search(endpoint_entry)
+            if match:
+                session_ids.add(match.group(1))
+        print(f"session ids: {session_ids}")
+        proxy_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="proxy-scram"}} |~ "({ep.endpoint_id})'
+        for session_id in session_ids:
+            proxy_query = f"{proxy_query}|({session_id})"
+        proxy_query = f'{proxy_query}"'
+        cli.run(proxy_query)
+
+
+def default_from():
+    return default_to() - timedelta(hours=0, minutes=60)
+
+
+def default_to():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # strip utc as logcli accepts timezone separately
+    return now.replace(tzinfo=None)
+
+
+description = """
+Dump logs for the given endpoint (--endpoint) or project (--project). The latter
+assumes the project has only one endpoint. By default, logs from all
+services are dumped. If at least one of --ps, --sk, --proxy etc is specified,
+only logs from selected services are dumped.
+
+--map prints all ids (endpoint id, timeline id etc) for the selected
+endpoint/project and exits.
+--query runs arbitrary query with logcli.
+
+By default the last hour range is fetched, --from and --to adjust that.
+
+NEON_PROD_KEY/NEON_STAGE_KEY env variables must be set, and SSO login performed.
+
+Examples:
+poetry run python nlogs -p nameless-union-279259
+poetry run python nlogs -e ep-red-moon-614539 -m
+poetry run python nlogs -e ep-red-moon-614539 --proxy --from 2023-04-08T18:52:33 --to 2023-04-08T18:57:33
+poetry run python nlogs -q '{neon_service="safekeeper"}'
+"""
+
+if __name__ == "__main__":
+    parser = ArgumentParser(
+        description=description, formatter_class=RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--env",
+        help="environment, 'staging' or 'prod' (default: %(default)s)",
+        type=str,
+        default="prod",
+        choices=["prod", "staging"],
+    )
+    parser.add_argument(
+        "-e",
+        "--endpoint",
+        help="endpoint name to dump logs for",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "-p",
+        "--project",
+        help="project name to dump logs for, assumes only one endpoint exists",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "-m",
+        "--map",
+        help="print ids (endpoint id, timeline id etc) for the endpoint and exit",
+        action="store_true",
+    )
+    parser.add_argument("--ps", help="dump pageserver logs", action="store_true")
+    parser.add_argument("--sk", help="dump safekeeper logs", action="store_true")
+    parser.add_argument(
+        "-c", "--compute", help="dump compute logs", action="store_true"
+    )
+    parser.add_argument(
+        "-b", "--pgbouncer", help="dump pgbouncer logs", action="store_true"
+    )
+    parser.add_argument("-x", "--proxy", help="dump proxy logs", action="store_true")
+    parser.add_argument(
+        "-f",
+        "--from",
+        dest="from_ts",
+        help="from timestamp, in ISO format. Must be in UTC, do not specify timezone here. For example, 2023-04-08T05:30:59. Default is now - 1 hour.",
+        type=datetime.datetime.fromisoformat,
+        default=default_from(),
+    )
+    parser.add_argument(
+        "-t",
+        "--to",
+        dest="to_ts",
+        help="to timestamp, in ISO format. Must be in UTC, do not specify timezone here. For example, 2023-04-08T05:30:59. Default is now.",
+        type=datetime.datetime.fromisoformat,
+        default=default_to(),
+    )
+    parser.add_argument(
+        "-q", "--query", help="run single custom logcli query", type=str, default=None
+    )
+    parser.add_argument(
+        "-l",
+        "--limit",
+        help="max number of log entries for single logcli query, passed as --limit to it",
+        type=int,
+        default=1000,
+    )
+    args = parser.parse_args()
+
+    if args.env == "prod":
+        key = os.environ["NEON_PROD_KEY"]
+        mgmt_v1_client = make_api_client("https://console.neon.tech", key)
+    else:
+        key = os.environ["NEON_STAGE_KEY"]
+        mgmt_v1_client = make_api_client("https://console.stage.neon.tech", key)
+
+    logcli = LogCli(args.from_ts, args.to_ts, args.limit)
+
+    if args.endpoint is not None or args.project is not None:
+        if args.endpoint is not None:
+            endpoint = endpoint_id_to_endpoint(mgmt_v1_client, args.endpoint)
+        else:
+            endpoint = project_id_to_endpoint(mgmt_v1_client, args.project)
+        print(endpoint)
+        if args.map:
+            sys.exit(0)
+
+        if args.ps or args.sk or args.compute or args.pgbouncer or args.proxy:
+            log_selection = LogSelection(
+                args.ps, args.sk, args.compute, args.pgbouncer, args.proxy
+            )
+        else:
+            log_selection = LogSelection(True, True, True, True, True)
+        setup_logcli()
+        endpoint_logs(logcli, endpoint, log_selection)
+        sys.exit(0)
+
+    if args.query is not None:
+        setup_logcli()
+        logcli.run(args.query)
