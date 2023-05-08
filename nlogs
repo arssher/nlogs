@@ -90,26 +90,29 @@ def endpoint_id_to_endpoint(client, endpoint_id):
     region_id = ep.parsed.endpoint.region_id.removeprefix(
         "aws-"
     )  # loki neon_region label doesn't have aws-
+    # us-west-2 is named us-west-2-new, but loki label doesn't have 'new'
+    region_id = region_id.removesuffix("-new")
     return Endpoint(
         project_id, tenant_id, region_id, branch_id, timeline_id, endpoint_id
     )
 
 
 # fill env variables required to access loki
-def setup_logcli():
+def setup_logcli(env):
     if "LOKI_ADDR" in os.environ:
         return  # exit if already set up to save time
+    profile = "prod" if env == "prod" else "dev"
     creds = subprocess.check_output(
         [
             "aws",
             "--profile",
-            "prod",
+            profile,
             "--region",
             "us-east-2",
             "secretsmanager",
             "get-secret-value",
             "--secret-id",
-            "prod/logcli-developer-credentials",
+            f"{profile}/logcli-developer-credentials",
         ]
     )
     secret_string = json.loads(json.loads(creds)["SecretString"])
@@ -138,7 +141,7 @@ class LogCli:
             f"--to={self.to_ts.isoformat()}Z",
             f"--limit={self.limit}",
             "--forward",
-            "--quiet",
+            # "--quiet",
             query,
         ]
         print(f"running {' '.join(cmd)}")
@@ -168,21 +171,22 @@ class LogSelection:
 
 
 # print logs of endpoint ep
-def endpoint_logs(cli: LogCli, ep: Endpoint, log_selection: LogSelection):
+def endpoint_logs(cli: LogCli, env: str, ep: Endpoint, log_selection: LogSelection):
+    env = "prod" if env == "prod" else "dev"
     if log_selection.ps:
-        ps_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="pageserver"}} |= "{ep.timeline_id}"'
+        ps_query = f'{{neon_env="{env}", neon_region="{ep.region_id}", neon_service="pageserver"}} |= "{ep.timeline_id}"'
         cli.run(ps_query)
     if log_selection.sk:
-        sk_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="safekeeper"}} |= "{ep.timeline_id}"'
+        sk_query = f'{{neon_env="{env}", neon_region="{ep.region_id}", neon_service="safekeeper"}} |= "{ep.timeline_id}"'
         cli.run(sk_query)
     if log_selection.compute:
-        compute_query = f'{{neon_env="prod", neon_region="{ep.region_id}", app="compute-node-{ep.endpoint_id}", container="compute-node"}} != "OpenTelemetry" != "serving /status"'
+        compute_query = f'{{neon_env="{env}", neon_region="{ep.region_id}", app="compute-node-{ep.endpoint_id}", container="compute-node"}} != "OpenTelemetry" != "serving /status"'
         cli.run(compute_query)
     if log_selection.pgbouncer:
-        pgbouncer_query = f'{{neon_env="prod", neon_region="{ep.region_id}", app="compute-node-{ep.endpoint_id}", container="pgbouncer"}}'
+        pgbouncer_query = f'{{neon_env="{env}", neon_region="{ep.region_id}", app="compute-node-{ep.endpoint_id}", container="pgbouncer"}}'
         cli.run(pgbouncer_query)
     if log_selection.proxy:
-        proxy_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="proxy-scram"}} |= "{ep.endpoint_id}"'
+        proxy_query = f'{{neon_env="{env}", neon_region="{ep.region_id}", neon_service="proxy-scram"}} |= "{ep.endpoint_id}"'
         # for proxy, find all session ids (uuid) and include in search
         proxy_endpoint_entries = cli.run(proxy_query, print_output=False)
         session_id_re = re.compile("session_id=(.{36})")
@@ -192,7 +196,7 @@ def endpoint_logs(cli: LogCli, ep: Endpoint, log_selection: LogSelection):
             if match:
                 session_ids.add(match.group(1))
         print(f"session ids: {session_ids}")
-        proxy_query = f'{{neon_env="prod", neon_region="{ep.region_id}", neon_service="proxy-scram"}} |~ "({ep.endpoint_id})'
+        proxy_query = f'{{neon_env="{env}", neon_region="{ep.region_id}", neon_service="proxy-scram"}} |~ "({ep.endpoint_id})'
         for session_id in session_ids:
             proxy_query = f"{proxy_query}|({session_id})"
         proxy_query = f'{proxy_query}"'
@@ -292,7 +296,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-l",
         "--limit",
-        help="max number of log entries for single logcli query, passed as --limit to it",
+        help="max number of log entries for single logcli query, passed as --limit to it. (default: %(default)s)",
         type=int,
         default=1000,
     )
@@ -302,7 +306,7 @@ if __name__ == "__main__":
         key = os.environ["NEON_PROD_KEY"]
         mgmt_v1_client = make_api_client("https://console.neon.tech", key)
     else:
-        key = os.environ["NEON_STAGE_KEY"]
+        key = os.environ["NEON_STAGING_KEY"]
         mgmt_v1_client = make_api_client("https://console.stage.neon.tech", key)
 
     logcli = LogCli(args.from_ts, args.to_ts, args.limit)
@@ -322,10 +326,11 @@ if __name__ == "__main__":
             )
         else:
             log_selection = LogSelection(True, True, True, True, True)
-        setup_logcli()
-        endpoint_logs(logcli, endpoint, log_selection)
+        setup_logcli(args.env)
+        endpoint_logs(logcli, args.env, endpoint, log_selection)
         sys.exit(0)
 
     if args.query is not None:
-        setup_logcli()
+        setup_logcli(args.env)
         logcli.run(args.query)
+        sys.exit(0)
